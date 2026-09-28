@@ -1,14 +1,9 @@
-"""Servidor MCP de Jam: un agente lee, escribe y corre el grafo abierto en Unreal, como TEXTO.
+"""Servidor MCP de Jam: el mismo grafo como texto en Unreal, Godot y Unity.
 
-Jam es un plugin de Unreal con un canvas de nodos, y su grafo tiene una segunda vista: el texto
-(una línea por nodo, `nombre = verbo @entrada clave=valor`). Este servidor le da esa vista a un
-agente. Corre FUERA del editor y le habla por HTTP local a la puerta que Jam abre al arrancar
-(`jam.web`, 127.0.0.1:8790, `POST /api/<función>`); lo que el agente aplica aparece en el canvas que
-el humano está mirando, y lo que el humano edita, el agente lo lee. Los dos trabajan sobre el MISMO
-grafo.
-
-El transporte es el de `oracle-mcp`: JSON-RPC UTF-8 sobre stdio, un mensaje por línea, sin
-cabeceras. `stdout` es sólo del protocolo; lo humano va a `stderr`. Sin dependencias.
+Unreal conserva su puerta HTTP local (jam.web, 8790) y el canvas del editor. Con Godot/Unity,
+EditorMotor guarda el texto en esta sesión y ejecuta el núcleo de Jam fuera del motor, por TCP.
+JSON-RPC UTF-8 por stdio, un mensaje por línea; stdout sólo protocolo, diagnósticos a stderr.
+Sin dependencias adicionales.
 """
 
 from __future__ import annotations
@@ -20,6 +15,7 @@ import urllib.error
 import urllib.request
 
 from jam_mcp import __version__
+from jam_mcp.motor import EditorMotor, ErrorMotor, JAM_DEFECTO
 
 PROTOCOLO = "2025-11-25"
 NOMBRE_SERVIDOR = "jam-mcp"
@@ -139,12 +135,12 @@ def _errores(crudos) -> list[dict]:
              "message": e.get("mensaje", "")} for e in crudos or []]
 
 
-def leer(editor: Editor, _args: dict) -> dict:
+def leer(editor: Editor | EditorMotor, _args: dict) -> dict:
     r = editor.llamar_json("leer_canvas")
     return {"text": r["texto"], "version": r["version"], "canvas_open": r["canvas_abierto"]}
 
 
-def aplicar(editor: Editor, args: dict) -> dict:
+def aplicar(editor: Editor | EditorMotor, args: dict) -> dict:
     texto = args.get("text")
     if not isinstance(texto, str) or not texto.strip():
         raise ErrorHerramienta("falta `text`: el grafo entero, una línea por nodo")
@@ -165,11 +161,11 @@ def aplicar(editor: Editor, args: dict) -> dict:
     return salida
 
 
-def ayuda(editor: Editor, args: dict) -> dict:
+def ayuda(editor: Editor | EditorMotor, args: dict) -> dict:
     return {"help": editor.llamar("ayuda_texto", str(args.get("query") or ""))}
 
 
-def preview(editor: Editor, args: dict) -> dict:
+def preview(editor: Editor | EditorMotor, args: dict) -> dict:
     accion = args.get("action")
     if accion not in ("bake", "discard"):
         raise ErrorHerramienta("`action` es bake o discard")
@@ -197,10 +193,20 @@ def _enviar(salida, mensaje: dict) -> None:
 
 
 class Servidor:
-    def __init__(self, editor: Editor, salida) -> None:
+    def __init__(self, editor: Editor | EditorMotor, salida) -> None:
         self.editor = editor
         self.salida = salida
         self.estado = "nuevo"
+        self.instrucciones = INSTRUCCIONES
+        if isinstance(editor, EditorMotor):
+            self.instrucciones = (
+                f"Jam crea escenas y geometría en {editor.motor}. El grafo abierto vive en esta "
+                "sesión MCP, sin canvas, y se pierde al cerrar el proceso. "
+                "Flujo: jam_help → jam_read_graph → jam_apply_graph con text y version. "
+                "Sin run valida con Compile; con run=true ejecuta y muestra Preview en el motor. "
+                "Leé errors por línea y nodes por estado. Ante conflict, partí del texto devuelto. "
+                "jam_preview bake fija el Preview y discard lo descarta. "
+                "canvas_open indica si el plugin contesta.")
 
     def _respuesta(self, mensaje: dict, resultado) -> None:
         _enviar(self.salida, {"jsonrpc": "2.0", "id": mensaje["id"], "result": resultado})
@@ -215,7 +221,7 @@ class Servidor:
             return
         try:
             contenido = _DESPACHO[nombre](self.editor, argumentos)
-        except ErrorHerramienta as e:
+        except (ErrorHerramienta, ErrorMotor) as e:
             self._respuesta(mensaje, {"content": [{"type": "text", "text": str(e)}], "isError": True})
             return
         texto = contenido.get("help") if nombre == "jam_help" else json.dumps(
@@ -234,14 +240,24 @@ class Servidor:
             self.estado = "inicializando"
             self._respuesta(mensaje, {"protocolVersion": PROTOCOLO, "capabilities": {"tools": {}},
                                       "serverInfo": {"name": NOMBRE_SERVIDOR, "version": __version__},
-                                      "instructions": INSTRUCCIONES})
+                                      "instructions": self.instrucciones})
         elif metodo == "notifications/initialized" and not es_pedido:
             if self.estado == "inicializando":
                 self.estado = "inicializado"
         elif metodo == "ping" and es_pedido:
             self._respuesta(mensaje, {})
         elif metodo == "tools/list" and es_pedido and self.estado == "inicializado":
-            self._respuesta(mensaje, {"tools": HERRAMIENTAS})
+            herramientas = HERRAMIENTAS
+            if isinstance(self.editor, EditorMotor):
+                herramientas = [dict(h) for h in HERRAMIENTAS]
+                herramientas[0]["description"] = (
+                    "El último texto aplicado en esta sesión y su version. "
+                    "canvas_open indica si el plugin del motor contesta; no hay canvas.")
+                herramientas[1]["description"] = (
+                    "Reemplaza el grafo de esta sesión por text (grafo ENTERO). Sin run valida "
+                    "con Compile; con run=true ejecuta y muestra Preview en el motor. Devuelve "
+                    "texto canónico, errores por línea y estados por nodo. version evita conflictos.")
+            self._respuesta(mensaje, {"tools": herramientas})
         elif metodo == "tools/call" and es_pedido and self.estado == "inicializado":
             params = mensaje.get("params")
             if not isinstance(params, dict) or params.get("name") not in _NOMBRES:
@@ -254,7 +270,7 @@ class Servidor:
         return True
 
 
-def servir(editor: Editor, entrada, salida) -> int:
+def servir(editor: Editor | EditorMotor, entrada, salida) -> int:
     servidor = Servidor(editor, salida)
     while True:
         try:
@@ -273,12 +289,24 @@ def servir(editor: Editor, entrada, salida) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Servidor MCP de Jam (stdio).")
+    parser.add_argument("--motor", choices=("unreal", "godot", "unity"), default="unreal",
+                        help="motor conectado (por defecto unreal)")
+    parser.add_argument("--jam", default=JAM_DEFECTO,
+                        help="Content/Python de Jam; sólo para Godot/Unity")
+    parser.add_argument("--puerto", type=int,
+                        help="puerto TCP del plugin (Godot 8792, Unity 8793)")
     parser.add_argument("--url", default=URL_DEFECTO,
                         help=f"la puerta de Jam en el editor (por defecto {URL_DEFECTO})")
     parser.add_argument("--timeout", type=float, default=600.0,
                         help="segundos que espera una llamada al editor (un Run puede hornear mallas)")
     args = parser.parse_args(argv)
-    return servir(Editor(args.url, args.timeout), sys.stdin.buffer, sys.stdout.buffer)
+    try:
+        editor = (Editor(args.url, args.timeout) if args.motor == "unreal" else
+                  EditorMotor(args.motor, args.jam, args.timeout, args.puerto))
+    except ErrorMotor as e:
+        print(f"JAM MCP — {e}", file=sys.stderr)
+        return 1
+    return servir(editor, sys.stdin.buffer, sys.stdout.buffer)
 
 
 if __name__ == "__main__":
