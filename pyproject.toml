@@ -1,0 +1,17 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "jam-mcp"
+dynamic = ["version"]
+description = "Servidor MCP de Jam: un agente lee, escribe y corre el grafo abierto en Unreal como texto"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+jam-mcp = "jam_mcp.server:main"
+
+[tool.hatch.version]
+path = "jam_mcp/__init__.py"
